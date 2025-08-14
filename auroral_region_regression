@@ -1,0 +1,140 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.linear_model import LinearRegression
+from datetime import datetime, timedelta
+import netCDF4 as nc
+import pandas as pd
+
+#-------------------------------------------------------
+# TOGGLES
+apply_deseasonalization = True
+apply_std_filter = True
+std_threshold = 2
+regress_with_kp = True #if False then regress with AE Index
+
+# Title and box size controls
+title_fontsize = 14
+figsize = (14, 5)
+
+#-------------------------------------------------------
+#Load Electron Density Data
+ne_file = "daily_electron_density_geomagnetic_2021_2024_nighttime.nc"
+with nc.Dataset(ne_file, "r") as ds:
+    log10_ne = ds.variables['log10_ne'][:]
+    time_var = ds.variables['time'][:]
+    mlat = ds.variables['mlat'][:]
+    mlon = ds.variables['mlon'][:]
+
+ne = 10 ** log10_ne #removing log10
+
+#-------------------------------------------------------
+# Create time array and properly aligning
+start_date = datetime(2021, 1, 1)
+date_array = [start_date + timedelta(days=int(t)) for t in time_var]
+day_of_year = np.array([(d - start_date).days for d in date_array])
+
+#-------------------------------------------------------
+# Load external drivers
+omni_file = "omni-daily_jan2021_may2024_kp_ae_f107_lyman"
+df = pd.read_csv(omni_file, delim_whitespace=True, header=None,
+                 names=["year", "doy", "hr", "kp", "dst", "f107", "ae", "lyman"]) #Lyman alpha regressed out when using daytime electron density data
+df['date'] = pd.to_datetime(df['year'] * 1000 + df['doy'], format='%Y%j')
+
+def lookup(var):
+    return np.array([
+        df.loc[df['date'] == pd.Timestamp(d.date()), var].values[0]
+        if d.date() in df['date'].dt.date.values else np.nan
+        for d in date_array
+    ])
+
+kp_for_ne = lookup("kp") / 10.0 #OMNIWeb multiplied kp * 10
+ae_for_ne = lookup("ae")
+
+#-------------------------------------------------------
+# Deseasonalization function
+def deseasonalize_with_harmonics(y, time_days):
+    mask = np.isfinite(y)
+    t = np.array(time_days)[mask]
+    y_fit = np.array(y)[mask]
+    omega1 = 2 * np.pi / 365.25
+    omega2 = 4 * np.pi / 365.25
+    A = np.column_stack([
+        np.ones_like(t),
+        np.cos(omega1 * t),
+        np.sin(omega1 * t),
+        np.cos(omega2 * t),
+        np.sin(omega2 * t)
+    ])
+    coeffs, _, _, _ = np.linalg.lstsq(A, y_fit, rcond=None)
+    full_A = np.column_stack([
+        np.ones_like(time_days),
+        np.cos(omega1 * time_days),
+        np.sin(omega1 * time_days),
+        np.cos(omega2 * time_days),
+        np.sin(omega2 * time_days)
+    ])
+    seasonal = full_A @ coeffs
+    return y - seasonal, seasonal
+
+#--------------------------------------------------------
+# Function for processing and plotting each hemisphere
+def process_and_plot(ax, lat_min, lat_max, hemisphere_label):
+    lat_mask = (mlat >= lat_min) & (mlat <= lat_max)
+    ne_band = ne[:, lat_mask, :]
+    ne_mean_band = np.nanmean(ne_band, axis=(1, 2))
+
+    if apply_deseasonalization:
+        ne_series, _ = deseasonalize_with_harmonics(ne_mean_band, day_of_year)
+    else:
+        ne_series = ne_mean_band
+
+    x_driver = kp_for_ne if regress_with_kp else ae_for_ne
+    driver_label = "Kp" if regress_with_kp else "AE"
+
+    if apply_std_filter:
+        mean_ne = np.nanmean(ne_series)
+        std_ne = np.nanstd(ne_series)
+        upper = mean_ne + std_threshold * std_ne
+        lower = mean_ne - std_threshold * std_ne
+        std_mask = (ne_series >= lower) & (ne_series <= upper)
+    else:
+        std_mask = np.full_like(ne_series, True, dtype=bool)
+
+    mask_valid = np.isfinite(x_driver) & np.isfinite(ne_series) & std_mask
+    x = x_driver[mask_valid]
+    y = ne_series[mask_valid]
+
+    reg = LinearRegression().fit(x.reshape(-1, 1), y)
+    slope = reg.coef_[0]
+    intercept = reg.intercept_
+    r = np.corrcoef(x, y)[0, 1]
+
+    ax.scatter(x, y / 1e10, color='purple', s=40, alpha=0.8, edgecolor='k')
+    ax.plot(np.sort(x), reg.predict(np.sort(x).reshape(-1, 1)) / 1e10, 'k-', linewidth=2)
+
+    ax.text(0.02, 0.96,
+            f"$N_e = {slope/1e10:.2f} \\times {driver_label} + ({intercept/1e10:.2f})$\nCorrelation $r = {r:.2f}$",
+            transform=ax.transAxes,
+            ha='left', va='top', fontsize=14,
+            bbox=dict(facecolor='white', alpha=0.8))
+
+    ax.text(0.95, 0.05, hemisphere_label,
+            transform=ax.transAxes,
+            ha='right', va='bottom', fontsize=16, weight='bold')
+
+    ax.set_xlabel(f"{driver_label} Index", fontsize=12)
+    ax.set_ylabel("Deseasonalized $N_e$ ($\\times10^{10}$ $e^-$/m³)", fontsize=12)
+    ax.set_title(f"{driver_label} vs Electron Density at 90km", fontsize=title_fontsize)
+
+#-------------------------------------------------------
+# Create figure with two subplots to show auroral regions side by side
+fig, axs = plt.subplots(1, 2, figsize=figsize, sharey=True)
+
+# Southern Auroral Oval
+process_and_plot(axs[0], -70, -50, "Southern Auroral Oval\nMLAT 50°S–70°S")
+
+# Northern Auroral Oval
+process_and_plot(axs[1], 50, 70, "Northern Auroral Oval\nMLAT 50°N–70°N")
+
+plt.tight_layout()
+plt.show()
